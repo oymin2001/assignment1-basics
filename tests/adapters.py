@@ -9,6 +9,11 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+import regex as re
+from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
+
+
 
 def run_linear(
     d_in: int,
@@ -562,6 +567,115 @@ def get_tokenizer(
     raise NotImplementedError
 
 
+
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+
+class Encoded_node:
+    def __init__(self, byte_list, freq):
+        self.byte_list = byte_list
+        self.prev = None
+        self.next = None
+        self.freq = freq
+        self.is_active = True
+
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+
+    assert isinstance(
+        split_special_token,
+        bytes,
+    ), "Must represent special token as a bytestring"
+
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    chunk_boundaries = [
+        i * chunk_size
+        for i in range(desired_num_chunks + 1)
+    ]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)
+
+        while True:
+            mini_chunk = file.read(mini_chunk_size)
+
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            found_at = mini_chunk.find(
+                split_special_token
+            )
+
+            if found_at != -1:
+                chunk_boundaries[bi] = (
+                    initial_position + found_at
+                )
+                break
+
+            initial_position += mini_chunk_size
+
+    return sorted(set(chunk_boundaries))
+
+def get_pre_token_counts(
+    txt: str,
+    special_tokens: list[str],
+) -> Counter:
+
+    pre_token_counts = Counter()
+
+    if special_tokens:
+        special_pattern = (
+            "("
+            + "|".join(
+                re.escape(token)
+                for token in special_tokens
+            )
+            + ")"
+        )
+        parts = re.split(special_pattern, txt)
+    else:
+        parts = [txt]
+
+    for part in parts:
+        if not part:
+            continue
+
+        if part in special_tokens:
+            continue
+
+        for match in re.finditer(PAT, part):
+            pre_token = match.group(0)
+
+            pre_token_counts[
+                pre_token.encode("utf-8")
+            ] += 1
+
+    return pre_token_counts
+
+def process_chunk(args):
+  input_path, start, end, special_tokens = args
+
+  with open(input_path, "rb") as f:
+    f.seek(start)
+    chunk = f.read(end - start).decode("utf-8", errors="ignore")
+
+  return get_pre_token_counts(chunk,special_tokens)
+
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -589,4 +703,144 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    if vocab_size < 256 + len(special_tokens):
+      raise ValueError()
+
+
+    vocab = {
+        i: bytes([i])
+        for i in range(256)
+    }
+
+    
+    merges = []
+
+    special_token_to_id = {}
+    next_id = 256
+
+    for special_token in special_tokens:
+        vocab[next_id] = special_token.encode("utf-8")
+        special_token_to_id[special_token] = next_id
+        next_id += 1
+
+    num_processes = kwargs.get("num_processes",os.cpu_count() or 1)
+
+
+    with open(input_path, "rb") as f:
+      boundaries = find_chunk_boundaries(f,num_processes,b"<|endoftext|>",)
+
+    jobs = [(input_path, start, end, special_tokens) for start, end in zip(boundaries[:-1], boundaries[1:])]
+
+    with ProcessPoolExecutor(max_workers=num_processes) as executor:
+        pre_token_counts_per_chunk = list(executor.map(process_chunk, jobs))
+
+    pre_token_counts = Counter()
+
+    for chunk_counts in pre_token_counts_per_chunk:
+        pre_token_counts.update(chunk_counts)
+
+    encoded_address = defaultdict(list)
+    pair_counts = defaultdict(int)
+
+    # 1. pre_token들을 전체 순회하여,(인접쌍: 인접쌍의 첫번째 주소1,...)를 encoded_address에 저장
+    for curr_pre_token, curr_freq in pre_token_counts.items():
+      p = [[b] for b in curr_pre_token] # pre_token을 바이트열로 변환
+
+      if not p:
+        continue
+
+      # pre_token마다 바이트열을 담은 연결리스트 생성
+      head = Encoded_node(p[0], curr_freq)
+      curr = head
+
+      for b in p[1:]:
+        new_node = Encoded_node(b, curr_freq)
+
+        curr.next = new_node
+        new_node.prev = curr
+
+        curr_pair = (bytes(curr.byte_list), bytes(curr.next.byte_list)) # 인접한 쌍의 바이트열을 담은 튜플을 인덱스(key)로 사용한다.
+        encoded_address[curr_pair].append(curr) # 인접쌍의 주소를 업데이트
+        pair_counts[curr_pair] += curr_freq  # 인접쌍의 빈도를 업데이트
+
+        curr = new_node
+
+
+    while len(vocab) < vocab_size:
+      if not encoded_address:
+            break
+
+      # 2. encoded_address에서 주소가 가장 많은쌍의 key를 most_frequent_pair에 저장
+      most_frequent_pair = max(pair_counts, key=lambda k: ( pair_counts[k], k)) # 최다빈도가 여러개이면 사전순
+      merges.append(most_frequent_pair)
+
+      # 3. vocab에 most_frequent_pair 추가 및 encoded_address에서 해당 key 제거
+      vocab[next_id] = most_frequent_pair[0] + most_frequent_pair[1]
+      next_id += 1
+      nodes_to_merge = list(encoded_address.pop(most_frequent_pair, []))
+      pair_counts.pop(most_frequent_pair)
+
+      for node in nodes_to_merge:
+        # 만약 [1,1]이 가장 빈번히 등장하는 pair이며, corpus가 [1],[1],[1],[1]이면, 각 주소를 0,1,2,3이라 할때,
+        # encoded_address = {(1,1):[0,1,2]}이므로 3을 수행하면, nodes_to_merge = [0,1,2], encoded_address={}이다.
+        # node=0에 대한 iteration 이후 node=1은 linked list에서 사라지지만 nodes_to_merge에는 존재한다.
+        # 그러므로, node=1에 대한 iteration에서 (None,1)의 merge가 일어날수있다. is_active 플래그로 현재 노드가 삭제된노드인지 확인한다.
+        if not node.is_active or node.next is None or not node.next.is_active:
+          continue
+
+        curr_pair = (bytes(node.byte_list), bytes(node.next.byte_list))
+        if curr_pair != most_frequent_pair:
+          continue
+
+        # 4. encoded_address에서 merge이후 사라질 pair들의 인접쌍의 첫번째 주소를 제거 및 pair_count에서 해당쌍의 빈도 제거, 5. encoded_address에서 value가 없는 key제거
+        if node.prev is not None:
+          old_prev_pair = (bytes(node.prev.byte_list), bytes(node.byte_list))
+
+          # merge후 사라질 인접쌍이 most_frequent_pair인 경우, encoded_address와 pair_counts에 대해 이미 pop()연산을 수행했기에 넘어간다.
+          if old_prev_pair != most_frequent_pair:
+            encoded_address[old_prev_pair].remove(node.prev)
+            pair_counts[old_prev_pair] -= node.freq
+
+            if not encoded_address[old_prev_pair]:
+              del encoded_address[old_prev_pair]
+              del pair_counts[old_prev_pair]
+
+        if node.next.next is not None:
+          old_next_pair = (bytes(node.next.byte_list), bytes(node.next.next.byte_list))
+
+          if old_next_pair != most_frequent_pair:  # 만약 사라질 pair의 인접쌍이 most_frequent_pair면 pop()연산을 이미 수행했으므로, 넘어간다.
+            encoded_address[old_next_pair].remove(node.next)
+            pair_counts[old_next_pair] -= node.freq
+
+
+            if not encoded_address[old_next_pair]:
+              del encoded_address[old_next_pair]
+              del pair_counts[old_next_pair]
+
+
+        # 6. encoded(corpus)에서 merge
+        # 첫번째 노드 기준 merge
+        node.byte_list.extend(node.next.byte_list)
+
+        # corpus에서 merge된 두번째 노드 제거
+        node.next.is_active = False
+        next_next_node = node.next.next
+        node.next = next_next_node
+        if next_next_node is not None:
+          next_next_node.prev = node
+
+
+        # 7. encoded_address에서 merge이후 merge와 인접한 새로운 쌍의 key 및 첫번째 주소 추가 및 빈도수 업데이트
+        if node.prev is not None:
+          new_prev_key = (bytes(node.prev.byte_list), bytes(node.byte_list))
+
+          encoded_address[new_prev_key].append(node.prev)
+          pair_counts[new_prev_key] += node.freq
+
+        if node.next is not None:
+          new_next_key = (bytes(node.byte_list), bytes(node.next.byte_list))
+
+          encoded_address[new_next_key].append(node)
+          pair_counts[new_next_key] += node.freq
+
+    return vocab, merges
