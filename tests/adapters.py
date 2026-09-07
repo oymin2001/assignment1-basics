@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+from typing import IO, Any, BinaryIO, Iterable
 
 import numpy.typing as npt
 import torch
@@ -544,6 +544,74 @@ def run_load_checkpoint(
     raise NotImplementedError
 
 
+class Tokenizer:
+  def __init__(self, vocab, merges, special_tokens=None):
+    self.vocab = vocab
+    self.bytes_to_id = {v: k for k, v in self.vocab.items()}
+    self.merges = merges
+    self.merge_ranks = {pair: rank for rank, pair in enumerate(self.merges)}
+    self.special_tokens = special_tokens or []
+
+  def encode(self, text: str) -> list[int]:
+    result_ids = []
+    ordered_special_tokens = sorted(self.special_tokens, key=len, reverse=True)
+
+    if self.special_tokens:
+      special_pattern = "(" + "|".join(re.escape(token) for token in ordered_special_tokens) + ")"
+      parts = re.split(special_pattern, text)
+    else:
+      parts = [text]
+
+    for part in parts:
+      if not part:
+        continue
+
+      if part in self.special_tokens:
+        result_ids.append(self.bytes_to_id[part.encode("utf-8")])
+        continue
+
+      for match in re.finditer(PAT, part):
+        pre_token = match.group(0)
+        merged_pre_token = self.merge_pre_token(pre_token)
+        result_ids.extend(self.bytes_to_id[token] for token in merged_pre_token)
+
+    return result_ids
+
+  def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
+    for text in iterable:
+      yield from self.encode(text)
+
+  def decode(self, tokens: list[int]) -> str:
+    byte_str = b"".join([self.vocab[token_id] for token_id in tokens])
+    return byte_str.decode("utf-8", errors="replace")
+  
+  def merge_pre_token(self, pre_token:str)->list[bytes]:
+    tokens = [bytes([b])for b in pre_token.encode("utf-8")]
+
+    while len(tokens) >= 2:
+      candidates = []
+
+      for i in range(len(tokens)-1):
+        pair = (tokens[i], tokens[i+1])
+        if pair in self.merge_ranks:
+          candidates.append((self.merge_ranks[pair], pair))
+
+      if not candidates:
+        break
+
+      _, best_pair = min(candidates)
+
+      i = 0
+      while i < len(tokens)-1:
+        curr_pair = (tokens[i], tokens[i+1])
+        if(curr_pair == best_pair):
+          tokens[i] = best_pair[0] + best_pair[1]
+          del tokens[i+1]
+        else:
+          i+=1
+
+    return tokens
+
 def get_tokenizer(
     vocab: dict[int, bytes],
     merges: list[tuple[bytes, bytes]],
@@ -564,7 +632,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(vocab, merges, special_tokens)
 
 
 
