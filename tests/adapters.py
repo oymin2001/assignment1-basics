@@ -416,6 +416,38 @@ def run_transformer_lm(
     raise NotImplementedError
 
 
+class RMSNorm(torch.nn.Module):
+  def __init__(
+      self,
+      d_model: int,
+      eps: float = 1e-5,
+      device: torch.device | None = None,
+      dtype: torch.dtype | None = None
+  ):
+    super().__init__()
+
+    self.d_model = d_model
+    self.eps = eps
+    self.device = device
+    self.dtype = dtype
+
+    self.weights = torch.nn.Parameter(
+        torch.ones((d_model), device = device, dtype = dtype)
+    )
+
+
+  def forward(self, x : Float[Tensor, " ... d_model"]) -> Float[Tensor, " ... d_model"]:
+    in_dtype = x.dtype
+
+    x = x.to(torch.float32)
+    mean_square = einsum(x, x, "... d_model, ... d_model -> ...") / self.d_model # x가 (B,T,d_model)이면 (B,T)가 된다. 즉 x[b,t,:]마다의 내적결과이다.
+    mean_square = mean_square.unsqueeze(-1) # 이후 브로드캐스팅 연산을 위해 (B,T) -> (B,T,1)
+    inv_rms = torch.rsqrt(mean_square + self.eps)
+    result = x * inv_rms # (B,T,d_model) * (B,T,1) -> (B,T,d_model)의 브로드 캐스팅 연산
+    result = result * self.weights # (B,T,d_model) * (d_model)의 d_model차원에서 element-wise product(Hadamard product)
+
+    return result.to(in_dtype)
+
 def run_rmsnorm(
     d_model: int,
     eps: float,
@@ -436,7 +468,10 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    rmsnorm_module = RMSNorm(d_model, eps)
+    rmsnorm_module.load_state_dict({"weights": weights})
+
+    return rmsnorm_module(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
