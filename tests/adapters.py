@@ -8,11 +8,37 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from einops import einsum
 
 import regex as re
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
+
+
+class Linear(torch.nn.Module):
+  def __init__(
+      self, 
+      d_in: int,
+      d_out: int,
+      device: torch.device | None = None,
+      dtype: torch.dtype | None = None
+      ):
+    super().__init__()
+    
+    self.d_in = d_in
+    self.d_out = d_out
+    self.device = device
+    self.dtype = dtype
+    
+    self.weights = torch.nn.Parameter(
+        torch.empty((d_out, d_in), device=device, dtype=dtype)
+    )
+    torch.nn.init.trunc_normal_(self.weights)
+
+  def forward(self, x : Float[Tensor, " ... d_in"]) -> Float[Tensor, " ... d_out"]:
+    return einsum(x, self.weights,"... d_in, d_out d_in -> ... d_out")
+    
 
 
 def run_linear(
@@ -33,9 +59,34 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
+    linear_module = Linear(d_in, d_out)
+    linear_module.load_state_dict({"weights": weights})
 
-    raise NotImplementedError
+    return linear_module(in_features)
 
+class Embedding(torch.nn.Module):
+  def __init__(
+      self,
+      num_embeddings : int, # size of vocab
+      embedding_dim : int, # d_model
+      device : torch.device | None = None,
+      dtype : torch.dtype | None = None
+  ):
+    super().__init__()
+
+    self.num_embeddings = num_embeddings
+    self.embedding_dim = embedding_dim
+    self.device = device
+    self.dtype = dtype
+
+    self.weights = torch.nn.Parameter(
+        torch.empty((num_embeddings, embedding_dim), device=device, dtype=dtype)
+    )
+    torch.nn.init.trunc_normal_(self.weights)
+
+  def forward(self, token_ids : Int[Tensor, "..."]) -> Float[Tensor, "... embedding_dim"]:
+    # token_ids의 각 값은 x \in [0,num_embeddings-1]사이이고, W[x,:]를 출력해야한다.
+    return self.weights[token_ids]
 
 def run_embedding(
     vocab_size: int,
@@ -55,8 +106,10 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
+    embedding_module = Embedding(vocab_size, d_model)
+    embedding_module.load_state_dict({"weights": weights})
 
-    raise NotImplementedError
+    return embedding_module(token_ids)
 
 
 def run_swiglu(
