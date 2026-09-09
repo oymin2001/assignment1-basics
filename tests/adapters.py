@@ -112,6 +112,33 @@ def run_embedding(
     return embedding_module(token_ids)
 
 
+class SwiGLU(torch.nn.Module):
+  def __init__(
+      self,
+      d_model : int,
+      d_ff : int,
+      device : torch.device | None = None,
+      dtype : torch.dtype | None = None
+  ):
+    super().__init__()
+
+    self.d_model = d_model
+    self.d_ff = d_ff
+
+    self.linear_module_1 = Linear(d_model, d_ff, device, dtype)
+    self.linear_module_2 = Linear(d_ff, d_model, device, dtype)
+    self.linear_module_3 = Linear(d_model, d_ff, device, dtype)
+
+
+  def forward(self, x : Float[Tensor, " ... d_model"]) -> Float[Tensor, " ... d_model"]:
+    non_linear_gate = self.silu(self.linear_module_1(x))
+    content_branch = self.linear_module_3(x)
+
+    return self.linear_module_2(non_linear_gate * content_branch)
+
+  def silu(self, h : Float[Tensor, "... d_ff"]) -> Float[Tensor, "... d_ff"]:
+    return h * torch.sigmoid(h)
+
 def run_swiglu(
     d_model: int,
     d_ff: int,
@@ -134,14 +161,14 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    swiglu = SwiGLU(d_model, d_ff)
+    swiglu.load_state_dict({
+        "linear_module_1.weights": w1_weight,
+        "linear_module_2.weights": w2_weight,
+        "linear_module_3.weights": w3_weight,
+    })
+    
+    return swiglu(in_features)
 
 
 def run_scaled_dot_product_attention(
