@@ -13,7 +13,7 @@ from einops import einsum
 import regex as re
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
-
+import einops
 
 
 class Linear(torch.nn.Module):
@@ -266,6 +266,49 @@ def run_multihead_self_attention_with_rope(
     raise NotImplementedError
 
 
+class RotaryPositinoalEmbedding(torch.nn.Module):
+  def __init__(
+      self,
+      theta : float,
+      d_k : int,
+      max_seq_len : int,
+      device : torch.device | None = None,
+  ):
+    super().__init__()
+
+    self.theta = theta
+    self.d_k = d_k
+    self.max_seq_len = max_seq_len
+    self.device = device
+
+    self.register_buffer("rope_cache",self.get_rope_cache(),persistent=False)
+
+  def forward(self, x : Float[Tensor, " ... sequence_length d_k"], token_positions : Int[Tensor, " ... sequence_length"]) -> Float[Tensor, " ... sequence_length d_k"]:
+    x_pair = einops.rearrange(x, "... s (pair two) -> ... s pair two", two=2)
+    rotation = self.rope_cache[token_positions]
+
+    cos = rotation[..., 0]
+    sin = rotation[..., 1]
+
+    x1 = x_pair[..., 0]
+    x2 = x_pair[..., 1]
+
+    rotated_x1 = x1 * cos - x2 * sin
+    rotated_x2 = x1 * sin + x2 * cos
+    result = torch.stack((rotated_x1, rotated_x2), dim=-1)
+    result = einops.rearrange(result, "... s pair two -> ... s (pair two)")
+
+    return result
+
+  def get_rope_cache(self) -> Float[Tensor, "max_seq_len d_k/2 2"]:
+    position = torch.arange(self.max_seq_len, device=self.device)
+    pair_index = torch.arange(self.d_k // 2, device=self.device)
+    angular_freq = (self.theta ** (-2 * pair_index / self.d_k))
+
+    angles = einsum(position, angular_freq, "i, k -> i k")
+    result = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
+    return result
+
 def run_rope(
     d_k: int,
     theta: float,
@@ -285,7 +328,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope = RotaryPositinoalEmbedding(theta, d_k, max_seq_len)
+    return rope(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
