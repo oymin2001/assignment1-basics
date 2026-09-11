@@ -230,8 +230,66 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    
+    Q = einsum(in_features, q_proj_weight, "... d_in, d_out d_in -> ... d_out")
+    K = einsum(in_features, k_proj_weight, "... d_in, d_out d_in -> ... d_out")
+    V = einsum(in_features, v_proj_weight, "... d_in, d_out d_in -> ... d_out")
 
+    seq_len = in_features.shape[-2]
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
+
+    Q_h = einops.rearrange(Q, "... seq_len (num_heads d_k)-> ... num_heads seq_len d_k", num_heads=num_heads)
+    K_h = einops.rearrange(K, "... seq_len (num_heads d_k)-> ... num_heads seq_len d_k", num_heads=num_heads)
+    V_h = einops.rearrange(V, "... seq_len (num_heads d_v)-> ... num_heads seq_len d_v", num_heads=num_heads)
+
+    mha_concat= run_scaled_dot_product_attention(Q_h,K_h,V_h,causal_mask)
+    mha_concat = einops.rearrange(mha_concat, "... num_heads seq_len d_v-> ... seq_len (num_heads d_v)")
+    mha_proj = einsum(mha_concat, o_proj_weight, "... d_in, d_out d_in -> ... d_out")
+    return mha_proj
+
+
+class RotaryPositinoalEmbedding_MHA(torch.nn.Module):
+  def __init__(
+      self,
+      theta : float,
+      d_k : int,
+      max_seq_len : int,
+      device : torch.device | None = None,
+  ):
+    super().__init__()
+
+    self.theta = theta
+    self.d_k = d_k
+    self.max_seq_len = max_seq_len
+    self.device = device
+
+    self.register_buffer("rope_cache",self.get_rope_cache(),persistent=False)
+
+  def forward(self, x : Float[Tensor, " ... num_heads sequence_length d_k"], token_positions : Int[Tensor, " ... num_heads sequence_length"]) -> Float[Tensor, " ... sequence_length d_k"]:
+    x_pair = einops.rearrange(x, "... s (pair two) -> ... s pair two", two=2)
+    rotation = self.rope_cache[token_positions].unsqueeze(1) # MHA에서는 (... num_heads seq_len d_k)가 들어오므로, head축 브로드캐스팅을 위해 축을 추가한다.
+
+    cos = rotation[..., 0]
+    sin = rotation[..., 1]
+
+    x1 = x_pair[..., 0]
+    x2 = x_pair[..., 1]
+
+    rotated_x1 = x1 * cos - x2 * sin
+    rotated_x2 = x1 * sin + x2 * cos
+    result = torch.stack((rotated_x1, rotated_x2), dim=-1)
+    result = einops.rearrange(result, "... s pair two -> ... s (pair two)")
+
+    return result
+
+  def get_rope_cache(self) -> Float[Tensor, "max_seq_len d_k/2 2"]:
+    position = torch.arange(self.max_seq_len, device=self.device)
+    pair_index = torch.arange(self.d_k // 2, device=self.device)
+    angular_freq = (self.theta ** (-2 * pair_index / self.d_k))
+
+    angles = einsum(position, angular_freq, "i, k -> i k")
+    result = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
+    return result
 
 def run_multihead_self_attention_with_rope(
     d_model: int,
@@ -270,7 +328,27 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    Q = einsum(in_features, q_proj_weight, "... d_in, d_out d_in -> ... d_out")
+    K = einsum(in_features, k_proj_weight, "... d_in, d_out d_in -> ... d_out")
+    V = einsum(in_features, v_proj_weight, "... d_in, d_out d_in -> ... d_out")
+
+    seq_len = in_features.shape[-2] 
+    d_k = d_model // num_heads
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
+
+    Q_h = einops.rearrange(Q, "... seq_len (num_heads d_k)-> ... num_heads seq_len d_k", num_heads=num_heads)
+    K_h = einops.rearrange(K, "... seq_len (num_heads d_k)-> ... num_heads seq_len d_k", num_heads=num_heads)
+    V_h = einops.rearrange(V, "... seq_len (num_heads d_v)-> ... num_heads seq_len d_v", num_heads=num_heads)
+
+
+    rope = RotaryPositinoalEmbedding_MHA(theta, d_k, max_seq_len)
+
+    Q_h_rope = rope(Q_h, token_positions)
+    K_h_rope = rope(K_h, token_positions)
+
+    mha_concat= run_scaled_dot_product_attention(Q_h_rope,K_h_rope,V_h,causal_mask)
+    mha_concat = einops.rearrange(mha_concat, "... num_heads seq_len d_v-> ... seq_len (num_heads d_v)")
+    return einsum(mha_concat, o_proj_weight, "... d_in, d_out d_in -> ... d_out")
 
 
 class RotaryPositinoalEmbedding(torch.nn.Module):
