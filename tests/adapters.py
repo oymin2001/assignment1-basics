@@ -8,6 +8,7 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+import math
 from einops import einsum
 
 import regex as re
@@ -189,7 +190,13 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    d_k = Q.shape[-1]
+    scores = einsum(Q, K, "... queries d_k, ... keys d_k -> ... queries keys") / math.sqrt(d_k)
+    if mask is not None:
+      scores = scores.masked_fill(~mask, -torch.inf)
+    scores = torch.softmax(scores, dim=-1)
+
+    return einsum(scores, V, "... queries keys, ... keys d_v -> ... queries d_v")
 
 
 def run_multihead_self_attention(
@@ -595,7 +602,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    c = torch.max(in_features, dim=dim).values.unsqueeze(dim)
+    return torch.exp(in_features - c) / torch.sum(torch.exp(in_features - c), dim=dim).unsqueeze(dim)
 
 
 def run_cross_entropy(
