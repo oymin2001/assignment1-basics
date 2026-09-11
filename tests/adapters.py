@@ -248,48 +248,6 @@ def run_multihead_self_attention(
     return mha_proj
 
 
-class RotaryPositinoalEmbedding_MHA(torch.nn.Module):
-  def __init__(
-      self,
-      theta : float,
-      d_k : int,
-      max_seq_len : int,
-      device : torch.device | None = None,
-  ):
-    super().__init__()
-
-    self.theta = theta
-    self.d_k = d_k
-    self.max_seq_len = max_seq_len
-    self.device = device
-
-    self.register_buffer("rope_cache",self.get_rope_cache(),persistent=False)
-
-  def forward(self, x : Float[Tensor, " ... num_heads sequence_length d_k"], token_positions : Int[Tensor, " ... num_heads sequence_length"]) -> Float[Tensor, " ... sequence_length d_k"]:
-    x_pair = einops.rearrange(x, "... s (pair two) -> ... s pair two", two=2)
-    rotation = self.rope_cache[token_positions].unsqueeze(1) # MHA에서는 (... num_heads seq_len d_k)가 들어오므로, head축 브로드캐스팅을 위해 축을 추가한다.
-
-    cos = rotation[..., 0]
-    sin = rotation[..., 1]
-
-    x1 = x_pair[..., 0]
-    x2 = x_pair[..., 1]
-
-    rotated_x1 = x1 * cos - x2 * sin
-    rotated_x2 = x1 * sin + x2 * cos
-    result = torch.stack((rotated_x1, rotated_x2), dim=-1)
-    result = einops.rearrange(result, "... s pair two -> ... s (pair two)")
-
-    return result
-
-  def get_rope_cache(self) -> Float[Tensor, "max_seq_len d_k/2 2"]:
-    position = torch.arange(self.max_seq_len, device=self.device)
-    pair_index = torch.arange(self.d_k // 2, device=self.device)
-    angular_freq = (self.theta ** (-2 * pair_index / self.d_k))
-
-    angles = einsum(position, angular_freq, "i, k -> i k")
-    result = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
-    return result
 
 def run_multihead_self_attention_with_rope(
     d_model: int,
@@ -340,11 +298,8 @@ def run_multihead_self_attention_with_rope(
     K_h = einops.rearrange(K, "... seq_len (num_heads d_k)-> ... num_heads seq_len d_k", num_heads=num_heads)
     V_h = einops.rearrange(V, "... seq_len (num_heads d_v)-> ... num_heads seq_len d_v", num_heads=num_heads)
 
-
-    rope = RotaryPositinoalEmbedding_MHA(theta, d_k, max_seq_len)
-
-    Q_h_rope = rope(Q_h, token_positions)
-    K_h_rope = rope(K_h, token_positions)
+    Q_h_rope = run_rope(d_k, theta, max_seq_len, Q_h, token_positions)
+    K_h_rope = run_rope(d_k, theta, max_seq_len, K_h, token_positions)
 
     mha_concat= run_scaled_dot_product_attention(Q_h_rope,K_h_rope,V_h,causal_mask)
     mha_concat = einops.rearrange(mha_concat, "... num_heads seq_len d_v-> ... seq_len (num_heads d_v)")
